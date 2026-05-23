@@ -10,6 +10,12 @@ import threading
 import queue
 
 from prompts.DNA import get_manager_prompt
+from core.progress import (
+    claude_progress_events,
+    codex_progress_event,
+    progress_display_line,
+    write_progress_line,
+)
 
 IS_WINDOWS = platform.system() == "Windows"
 
@@ -107,6 +113,14 @@ def _is_rate_limit(text):
 
 def _display_stream_event(event, tag):
     """Print a stream-json event to terminal."""
+    progress_events = claude_progress_events(event)
+    if progress_events:
+        for progress in progress_events:
+            line = progress_display_line(progress)
+            if line:
+                print(f"  [{tag}] {line}", flush=True)
+        return
+
     t = event.get("type", "")
 
     if t == "system" and event.get("subtype") == "init":
@@ -181,6 +195,12 @@ def _codex_item_label(item):
 
 def _display_codex_stream_event(msg, tag, state):
     """Print useful Codex app-server notifications as a live activity trace."""
+    progress = codex_progress_event(msg, state)
+    line = progress_display_line(progress)
+    if line:
+        print(f"  [{tag}] {line}", flush=True)
+    return
+
     method = msg.get("method", "")
     params = msg.get("params", {})
 
@@ -266,7 +286,7 @@ def _display_codex_stream_event(msg, tag, state):
         print(f"  [{tag}] turn {status}{suffix}", flush=True)
 
 
-def _run_streaming(cmd, input_text, tag, timeout=180, on_tools=None):
+def _run_streaming(cmd, input_text, tag, timeout=180, on_tools=None, progress_log_path=None):
     """Run claude CLI with stream-json, show events on terminal.
     on_tools(tools_list) is called for tool JSON found in intermediate assistant texts.
     Returns (result_text, rate_limit_msg_or_None, returncode, executed_tools)."""
@@ -322,6 +342,8 @@ def _run_streaming(cmd, input_text, tag, timeout=180, on_tools=None):
                 rate_limit_msg = line
             continue
 
+        for progress in claude_progress_events(event):
+            write_progress_line(progress_log_path, progress)
         _display_stream_event(event, tag)
 
         etype = event.get("type", "")
@@ -383,6 +405,7 @@ def claude_code(text, carbon_id, on_tools=None):
     system_prompt = get_manager_prompt(carbon_id)
     prompt_file = _write_prompt_file(carbon_id, system_prompt)
     tag = f"manager:{carbon_id}"
+    progress_log_path = _codex_manager_progress_file(_codex_manager_stream_file(carbon_id))
 
     # Stream with --resume
     cmd = [
@@ -395,7 +418,13 @@ def claude_code(text, carbon_id, on_tools=None):
     ]
 
     try:
-        result_text, rate_limit, rc, executed_tools, stderr_text, error_subtype, error_msg = _run_streaming(cmd, text, tag, on_tools=on_tools)
+        result_text, rate_limit, rc, executed_tools, stderr_text, error_subtype, error_msg = _run_streaming(
+            cmd,
+            text,
+            tag,
+            on_tools=on_tools,
+            progress_log_path=progress_log_path,
+        )
         if rc == 0 and result_text.strip():
             return result_text.strip(), rate_limit, executed_tools
         # Session not found — check the exact error message
@@ -411,7 +440,13 @@ def claude_code(text, carbon_id, on_tools=None):
                 "--output-format=stream-json",
                 "--verbose",
             ]
-            result_text, rate_limit, rc, executed_tools, stderr_text, error_subtype, error_msg = _run_streaming(cmd_new, text, tag, on_tools=on_tools)
+            result_text, rate_limit, rc, executed_tools, stderr_text, error_subtype, error_msg = _run_streaming(
+                cmd_new,
+                text,
+                tag,
+                on_tools=on_tools,
+                progress_log_path=progress_log_path,
+            )
             if rc == 0 and result_text.strip():
                 return result_text.strip(), rate_limit, executed_tools
             # If that also failed, give up gracefully
@@ -590,6 +625,12 @@ def _codex_manager_stream_file(carbon_id):
     return os.path.join(MANAGER_STREAMS_DIR, f"{safe_carbon_id}-{int(time.time() * 1000)}.jsonl")
 
 
+def _codex_manager_progress_file(stream_log_path):
+    if stream_log_path.endswith(".jsonl"):
+        return stream_log_path[:-6] + ".progress.jsonl"
+    return stream_log_path + ".progress"
+
+
 def _read_codex_thread_id(carbon_id):
     path = _codex_thread_file(carbon_id)
     if not os.path.exists(path):
@@ -645,6 +686,7 @@ def codex_app_server(text, carbon_id, on_tools=None):
     error_msg = ""
     last_preview_at = 0
     stream_log_path = _codex_manager_stream_file(carbon_id)
+    progress_log_path = _codex_manager_progress_file(stream_log_path)
     stream_display_state = {}
 
     try:
@@ -689,6 +731,8 @@ def codex_app_server(text, carbon_id, on_tools=None):
 
             method = msg.get("method", "")
             params = msg.get("params", {})
+            progress = codex_progress_event(msg, stream_display_state)
+            write_progress_line(progress_log_path, progress)
             _display_codex_stream_event(msg, tag, stream_display_state)
 
             if method == "item/agentMessage/delta":
@@ -741,11 +785,14 @@ def codex_app_server(text, carbon_id, on_tools=None):
             rate_limit_msg = output
         if output:
             print(f"  [{tag}] stream log: {stream_log_path}", flush=True)
+            print(f"  [{tag}] progress log: {progress_log_path}", flush=True)
             return output, rate_limit_msg, executed_tools
         if error_msg:
             print(f"  [{tag}] stream log: {stream_log_path}", flush=True)
+            print(f"  [{tag}] progress log: {progress_log_path}", flush=True)
             return f'{{"tools": [{{"tool": "reply", "message": "Manager error: {error_msg}"}}, {{"tool": "do_nothing"}}]}}', rate_limit_msg, executed_tools
         print(f"  [{tag}] stream log: {stream_log_path}", flush=True)
+        print(f"  [{tag}] progress log: {progress_log_path}", flush=True)
         return "", rate_limit_msg, executed_tools
 
     except subprocess.TimeoutExpired:

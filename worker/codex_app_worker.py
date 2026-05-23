@@ -8,6 +8,9 @@ import sys
 import threading
 import time
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from core.progress import codex_progress_event
+
 
 CODEX_CMD = shutil.which("codex") or shutil.which("codex.cmd") or "codex"
 
@@ -37,6 +40,7 @@ class CodexAppServer:
         )
         threading.Thread(target=self._read_stdout, daemon=True).start()
         threading.Thread(target=self._read_stderr, daemon=True).start()
+        self.progress_state = {}
 
     def _emit(self, payload):
         print(json.dumps(payload, separators=(",", ":")), flush=True)
@@ -46,6 +50,13 @@ class CodexAppServer:
             line = line.rstrip("\n")
             if line:
                 print(line, flush=True)
+                try:
+                    msg = json.loads(line)
+                    progress = codex_progress_event(msg, self.progress_state)
+                    if progress:
+                        print(json.dumps(progress, ensure_ascii=False, separators=(",", ":")), flush=True)
+                except (json.JSONDecodeError, ValueError):
+                    pass
                 self.messages.put(("stdout", line))
 
     def _read_stderr(self):
