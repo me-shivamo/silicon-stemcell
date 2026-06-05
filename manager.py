@@ -60,6 +60,37 @@ def get_brain():
     return brain if brain in {"claude", "codex"} else "claude"
 
 
+def get_brain_order():
+    """Return the configured manager provider order.
+
+    The first provider is the normal brain. Later entries are true fallbacks:
+    they are tried only when the provider above fails before producing a usable
+    manager response.
+    """
+    config = _read_silicon_config()
+    raw = config.get("brain_order")
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, list):
+        raw = [config.get("brain", "claude")]
+
+    providers = []
+    seen = set()
+    for item in raw:
+        if not isinstance(item, str):
+            continue
+        provider = item.strip().lower()
+        if provider == "chatgpt":
+            provider = "codex"
+        if provider in {"claude", "codex"} and provider not in seen:
+            seen.add(provider)
+            providers.append(provider)
+
+    if providers:
+        return providers
+    return [get_brain()]
+
+
 def _session_file(carbon_id, brain="claude"):
     suffix = "" if brain == "claude" else f"_{brain}"
     return os.path.join(SESSIONS_DIR, f"{carbon_id}{suffix}.txt")
@@ -809,10 +840,52 @@ def codex_app_server(text, carbon_id, on_tools=None):
 
 
 def manager_code(text, carbon_id, on_tools=None):
-    """Invoke the configured manager brain."""
-    if get_brain() == "codex":
-        return codex_app_server(text, carbon_id, on_tools=on_tools)
-    return claude_code(text, carbon_id, on_tools=on_tools)
+    """Invoke the configured manager brain.
+
+    Fallback providers are only tried after the provider above returns a
+    provider-level failure (empty output, timeout/rate-limit, or Manager error).
+    Bad tool JSON from a successful provider is fed back to that same manager by
+    the normal manager loop instead of silently switching brains.
+    """
+    last = None
+    errors = []
+    for provider in get_brain_order():
+        try:
+            if provider == "codex":
+                result = codex_app_server(text, carbon_id, on_tools=on_tools)
+            else:
+                result = claude_code(text, carbon_id, on_tools=on_tools)
+        except Exception as exc:
+            result = (
+                f'{{"tools": [{{"tool": "reply", "message": "Manager error: {exc}"}}, {{"tool": "do_nothing"}}]}}',
+                None,
+                [],
+            )
+
+        last = result
+        output, rate_limit, _executed_tools = result
+        if not _manager_provider_failed(output, rate_limit):
+            return result
+        errors.append(f"{provider}: {str(output or rate_limit)[:200]}")
+
+    if last is not None:
+        if errors:
+            print(f"  [manager:{carbon_id}] all configured brains failed: {' | '.join(errors)}", flush=True)
+        return last
+    return '{"tools": [{"tool": "do_nothing"}]}', None, []
+
+
+def _manager_provider_failed(output, rate_limit):
+    if rate_limit:
+        return True
+    text = (output or "").strip()
+    if not text:
+        return True
+    if text == TIMEOUT_MSG:
+        return True
+    if "Manager error:" in text:
+        return True
+    return False
 
 
 def parse_manager_output(output, debug=True):

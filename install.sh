@@ -35,32 +35,18 @@ confirm() {
     esac
 }
 
-choose_worker_provider_order() {
-    local worker_type="$1"
-    local default_choice="${2:-claude}"
-    local choice
-    local result
+choose_brain_provider_order() {
+    local primary="${1:-claude}"
+    local fallback="codex"
+    if [ "$primary" = "codex" ]; then
+        fallback="claude"
+    fi
 
-    printf "${BOLD}? Which provider should %s workers use – claude or codex?${RESET} [%s]: " "$worker_type" "$default_choice" >&2
-    read -r choice </dev/tty
-    choice="${choice:-$default_choice}"
-    case "$choice" in
-        codex)
-            if confirm "Keep claude as fallback for $worker_type workers?"; then
-                result='["codex", "claude"]'
-            else
-                result='["codex"]'
-            fi
-            ;;
-        *)
-            if confirm "Keep codex as fallback for $worker_type workers?"; then
-                result='["claude", "codex"]'
-            else
-                result='["claude"]'
-            fi
-            ;;
-    esac
-    echo "$result"
+    if confirm "Use $fallback as fallback brain for all manager and worker runs?"; then
+        printf '["%s", "%s"]\n' "$primary" "$fallback"
+    else
+        printf '["%s"]\n' "$primary"
+    fi
 }
 
 # If piped (curl | bash), we need /dev/tty for user input
@@ -448,19 +434,22 @@ BRAIN_CHOICE="claude"
 BROWSER_WORKERS='["claude"]'
 TERMINAL_WORKERS='["claude"]'
 WRITER_WORKERS='["claude"]'
+BRAIN_ORDER='["claude"]'
 if command -v claude &>/dev/null && command -v codex &>/dev/null; then
-    ask "Which brain should Silicon use – claude or codex? [claude]"
+    ask "Who do you want the brain to be – claude or codex? [claude]"
     read -r brain_ans </dev/tty
     brain_ans="${brain_ans:-claude}"
     case "$brain_ans" in
         codex) BRAIN_CHOICE="codex" ;;
         *) BRAIN_CHOICE="claude" ;;
     esac
-    BROWSER_WORKERS=$(choose_worker_provider_order "browser" "$BRAIN_CHOICE")
-    TERMINAL_WORKERS=$(choose_worker_provider_order "terminal" "$BRAIN_CHOICE")
-    WRITER_WORKERS=$(choose_worker_provider_order "writer" "$BRAIN_CHOICE")
+    BRAIN_ORDER=$(choose_brain_provider_order "$BRAIN_CHOICE")
+    BROWSER_WORKERS="$BRAIN_ORDER"
+    TERMINAL_WORKERS="$BRAIN_ORDER"
+    WRITER_WORKERS="$BRAIN_ORDER"
 elif command -v codex &>/dev/null; then
     BRAIN_CHOICE="codex"
+    BRAIN_ORDER='["codex"]'
     BROWSER_WORKERS='["codex"]'
     TERMINAL_WORKERS='["codex"]'
     WRITER_WORKERS='["codex"]'
@@ -639,6 +628,7 @@ silicon.setdefault("name", "Silicon")
 silicon.setdefault("run", "python main.py")
 silicon.setdefault("workers", {})
 silicon["brain"] = "$BRAIN_CHOICE"
+silicon["brain_order"] = provider_list("""$BRAIN_ORDER""", ["$BRAIN_CHOICE"])
 silicon["workers"] = {
     "browser": provider_list("""$BROWSER_WORKERS""", ["claude"]),
     "terminal": provider_list("""$TERMINAL_WORKERS""", ["claude"]),
@@ -745,32 +735,18 @@ confirm() {
     esac
 }
 
-choose_worker_provider_order() {
-    local worker_type="$1"
-    local default_choice="${2:-claude}"
-    local choice
-    local result
+choose_brain_provider_order() {
+    local primary="${1:-claude}"
+    local fallback="codex"
+    if [ "$primary" = "codex" ]; then
+        fallback="claude"
+    fi
 
-    printf "${BOLD}? Which provider should %s workers use – claude or codex?${RESET} [%s]: " "$worker_type" "$default_choice" >&2
-    read -r choice
-    choice="${choice:-$default_choice}"
-    case "$choice" in
-        codex)
-            if confirm "Keep claude as fallback for $worker_type workers?"; then
-                result='["codex", "claude"]'
-            else
-                result='["codex"]'
-            fi
-            ;;
-        *)
-            if confirm "Keep codex as fallback for $worker_type workers?"; then
-                result='["claude", "codex"]'
-            else
-                result='["claude"]'
-            fi
-            ;;
-    esac
-    echo "$result"
+    if confirm "Use $fallback as fallback brain for all manager and worker runs?"; then
+        printf '["%s", "%s"]\n' "$primary" "$fallback"
+    else
+        printf '["%s"]\n' "$primary"
+    fi
 }
 
 read_secret() {
@@ -1131,21 +1107,24 @@ PY
         local browser_workers='["claude"]'
         local terminal_workers='["claude"]'
         local writer_workers='["claude"]'
+        local brain_order='["claude"]'
         if command -v claude &>/dev/null && command -v codex &>/dev/null; then
             echo ""
             info "Detected both claude and codex."
-            printf "${BOLD}? Which brain should Silicon use – claude or codex?${RESET} [claude]: "
+            printf "${BOLD}? Who do you want the brain to be – claude or codex?${RESET} [claude]: "
             read -r brain_choice
             brain_choice="${brain_choice:-claude}"
             case "$brain_choice" in
                 codex) brain_choice="codex" ;;
                 *) brain_choice="claude" ;;
             esac
-            browser_workers=$(choose_worker_provider_order "browser" "$brain_choice")
-            terminal_workers=$(choose_worker_provider_order "terminal" "$brain_choice")
-            writer_workers=$(choose_worker_provider_order "writer" "$brain_choice")
+            brain_order=$(choose_brain_provider_order "$brain_choice")
+            browser_workers="$brain_order"
+            terminal_workers="$brain_order"
+            writer_workers="$brain_order"
         elif command -v codex &>/dev/null; then
             brain_choice="codex"
+            brain_order='["codex"]'
             browser_workers='["codex"]'
             terminal_workers='["codex"]'
             writer_workers='["codex"]'
@@ -1176,6 +1155,7 @@ if silicon_path.exists():
     except json.JSONDecodeError:
         silicon = {}
     silicon["brain"] = "$brain_choice"
+    silicon["brain_order"] = provider_list("""$brain_order""", ["$brain_choice"])
     silicon["workers"] = {
         "browser": provider_list("""$browser_workers""", ["claude"]),
         "terminal": provider_list("""$terminal_workers""", ["claude"]),

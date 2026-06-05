@@ -683,8 +683,15 @@ def _launch_with_provider_order(worker_id, task, worker_type, carbon_id, incogni
         if ok:
             return True, result
         errors.append(f"{provider}: {result}")
+        if not _is_provider_launch_failure(result):
+            return False, result
 
     return False, "Error: Could not start worker. " + " | ".join(errors)
+
+
+def _is_provider_launch_failure(result):
+    text = (result or "").strip()
+    return text.startswith("Claude launch failed:") or text.startswith("Codex launch failed:")
 
 
 def start_browser_worker(worker_id, task, carbon_id, incognito=False, resume=False):

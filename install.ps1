@@ -45,21 +45,6 @@ function Read-Secret {
     return [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($bstr)
 }
 
-function Read-WorkerProviderOrder {
-    param([string]$WorkerType, [string]$Default = "claude")
-    $choice = Read-Value "Which provider should $WorkerType workers use – claude or codex?" $Default
-    if ($choice -eq "codex") {
-        if (Read-Confirm "Keep claude as fallback for $WorkerType workers?") {
-            return @("codex", "claude")
-        }
-        return @("codex")
-    }
-    if (Read-Confirm "Keep codex as fallback for $WorkerType workers?") {
-        return @("claude", "codex")
-    }
-    return @("claude")
-}
-
 # ── Banner ────────────────────────────────────────────────────
 
 Clear-Host
@@ -275,16 +260,25 @@ $WriterWorkers = @("claude")
 $HasClaude = $null -ne (Get-Command claude -ErrorAction SilentlyContinue)
 $HasCodex = $null -ne (Get-Command codex -ErrorAction SilentlyContinue)
 if ($HasClaude -and $HasCodex) {
-    $brainInput = Read-Value "Which brain should Silicon use – claude or codex?" "claude"
+    $brainInput = Read-Value "Who do you want the brain to be – claude or codex?" "claude"
     if ($brainInput -eq "codex") { $BrainChoice = "codex" }
-    $BrowserWorkers = Read-WorkerProviderOrder "browser" "claude"
-    $TerminalWorkers = Read-WorkerProviderOrder "terminal" "claude"
-    $WriterWorkers = Read-WorkerProviderOrder "writer" "claude"
+    $FallbackBrain = if ($BrainChoice -eq "codex") { "claude" } else { "codex" }
+    if (Read-Confirm "Use $FallbackBrain as fallback brain for all manager and worker runs?") {
+        $BrainOrder = @($BrainChoice, $FallbackBrain)
+    } else {
+        $BrainOrder = @($BrainChoice)
+    }
+    $BrowserWorkers = $BrainOrder
+    $TerminalWorkers = $BrainOrder
+    $WriterWorkers = $BrainOrder
 } elseif ($HasCodex) {
     $BrainChoice = "codex"
+    $BrainOrder = @("codex")
     $BrowserWorkers = @("codex")
     $TerminalWorkers = @("codex")
     $WriterWorkers = @("codex")
+} else {
+    $BrainOrder = @($BrainChoice)
 }
 
 # ── silicon-browser ───────────────────────────────────────────
@@ -432,6 +426,11 @@ if ($silicon.PSObject.Properties.Name -contains "brain") {
     $silicon.brain = $BrainChoice
 } else {
     $silicon | Add-Member -NotePropertyName "brain" -NotePropertyValue $BrainChoice
+}
+if ($silicon.PSObject.Properties.Name -contains "brain_order") {
+    $silicon.brain_order = $BrainOrder
+} else {
+    $silicon | Add-Member -NotePropertyName "brain_order" -NotePropertyValue $BrainOrder
 }
 $silicon.workers = @{
     browser  = $BrowserWorkers
