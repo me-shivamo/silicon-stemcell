@@ -2,6 +2,7 @@ from core.interface import get_unread_events
 from core.cron import check_crons
 from core.messages import check_manager_messages
 from worker.handler import check_completed_workers_formatted, clean_old_archives
+from update import check_for_system_update
 
 LOOP_TICK = 10  # Time in seconds between each loop tick
 ARCHIVE_FOR = 7 * 24 * 60 * 60  # Time in seconds to keep archived worker states (7 days)
@@ -24,6 +25,12 @@ EVENT_LOOP = [
         "description": "Check for pending inter-manager messages",
         "execute": check_manager_messages,
         "on_error": lambda e: print(f"[Manager Messages Error] {e}", flush=True),
+    },
+    {
+        "name": "check_system_updates",
+        "description": "Check whether a Silicon system update is available",
+        "execute": check_for_system_update,
+        "on_error": lambda e: print(f"[Update Error] {e}", flush=True),
     },
     {
         "name": "check_workers",
