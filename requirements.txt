@@ -2,3 +2,4 @@ requests
 google-genai
 websockets
 croniter
+certifi

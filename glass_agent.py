@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import signal
+import ssl
 import subprocess
 import sys
 import time
@@ -59,6 +60,15 @@ def ws_url(server_url: str, api_key: str) -> str:
         base = "ws://" + base[7:]
     sep = "&" if "?" in base else "?"
     return f"{base}/ws/glass/agent/{sep}silicon_key={api_key}"
+
+
+def ssl_context() -> ssl.SSLContext:
+    try:
+        import certifi
+
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        return ssl.create_default_context()
 
 
 def detect_status(root: Path) -> str:
@@ -159,7 +169,7 @@ def run_live(root: Path, config: dict, running: list[bool]) -> None:
     name = silicon_name(root)
     url = ws_url(config["server_url"], config["api_key"])
     print(f"[glass-agent] connecting to {config['server_url'].rstrip('/')}/ws/glass/agent/", flush=True)
-    with connect(url, close_timeout=5, open_timeout=10) as ws:
+    with connect(url, close_timeout=5, open_timeout=10, ssl=ssl_context()) as ws:
         print("[glass-agent] connected", flush=True)
         send_json(ws, {
             "type": "handshake",
