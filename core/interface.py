@@ -278,21 +278,22 @@ class InterfaceClient:
         )
 
     def whoami(self) -> Any:
-        return self.run(["whoami"], timeout=30)
+        return self.run(["me"], timeout=30)
 
     def rooms_list(self) -> Any:
         return self.run(["rooms", "list"], timeout=30)
 
     def room_members(self, room_id: str) -> Any:
-        return self.run(["rooms", "members", room_id], timeout=30)
+        payload = self.run(["rooms", "show", room_id, "--limit", "0"], timeout=45)
+        if isinstance(payload, dict) and "members" in payload:
+            return payload.get("members") or []
+        return payload
 
     def ensure_direct_room(self, contact_type: str, fixed_id: str) -> Any:
-        return self.run(["rooms", "direct", "--kind", contact_type, fixed_id], timeout=60)
+        return self.run(["rooms", "direct", contact_type, fixed_id], timeout=60)
 
     def events_list(self, room_id: str, since: str = "") -> Any:
-        args = ["events", "list", "--room", room_id]
-        if since:
-            args.extend(["--since", since])
+        args = ["messages", "list", room_id, "--limit", "200"]
         return self.run(args, timeout=45)
 
     def listen_all_process(self) -> subprocess.Popen:
@@ -317,9 +318,9 @@ class InterfaceClient:
         return self.run(["stt", value], timeout=180)
 
     def progress(self, room_id: str, group: str, state: str, message: str = "") -> Any:
-        args = ["progress", room_id, "--group", group, "--state", state]
+        args = ["progress", room_id, state, "--group", group]
         if message:
-            args.extend(["--message", message])
+            args.extend(["--note", message])
         return self.run(args, timeout=30, check=False)
 
     def remote_browser(self, room_id: str, url: str, ttl_minutes: int) -> Any:
@@ -371,8 +372,14 @@ def _normalize_contact_type(value: Any) -> str:
 
 def _member_fixed_id(member: dict[str, Any], contact_type: str) -> str:
     if contact_type == "silicon":
-        return str(member.get("silicon_id") or member.get("siliconId") or member.get("username") or member.get("id") or "").strip()
-    return str(member.get("carbon_id") or member.get("carbonId") or member.get("public_id") or member.get("id") or "").strip()
+        fixed = member.get("silicon_id") or member.get("siliconId") or member.get("username")
+    else:
+        fixed = member.get("carbon_id") or member.get("carbonId") or member.get("public_id")
+    if fixed:
+        return str(fixed).strip()
+    if "member_kind" in member:
+        return ""
+    return str(member.get("id") or "").strip()
 
 
 def _display_name(obj: dict[str, Any], fallback: str) -> str:
@@ -497,6 +504,8 @@ def _room_is_direct(room: dict[str, Any]) -> bool:
         return bool(room.get("is_direct"))
     if "direct" in room:
         return bool(room.get("direct"))
+    if str(room.get("kind") or room.get("type") or "").lower() == "direct":
+        return True
     members = room.get("members")
     return isinstance(members, list) and len(members) <= 2
 
@@ -515,6 +524,11 @@ def _other_member(members: list[Any], own_ids: list[str]) -> dict[str, Any] | No
 
 
 def _direct_contact_from_room(room: dict[str, Any], members: list[Any], own_ids: list[str]) -> dict[str, Any] | None:
+    peers = room.get("peers")
+    other = _other_member(peers, own_ids) if isinstance(peers, list) else None
+    if other is not None:
+        return other
+
     other = _other_member(members, own_ids) if members else None
     if other is not None:
         return other
@@ -673,7 +687,11 @@ def _event_id(event: dict[str, Any]) -> str:
 
 def _event_room_id(event: dict[str, Any]) -> str:
     content = _event_content(event)
-    return _first_text(event.get("room_id"), event.get("roomId"), event.get("room"), content.get("room_id"))
+    room_id = _first_text(event.get("room_id"), event.get("roomId"), content.get("room_id"))
+    if room_id:
+        return room_id
+    room = event.get("room")
+    return room if isinstance(room, str) else ""
 
 
 def _event_sender(event: dict[str, Any]) -> str:
@@ -978,7 +996,10 @@ def _listener_loop(stop_event: threading.Event) -> None:
                     continue
                 if isinstance(payload, dict):
                     if isinstance(payload.get("event"), dict):
-                        _event_queue.put(payload["event"])
+                        event = dict(payload["event"])
+                        if payload.get("room_id") and not event.get("room_id") and not event.get("roomId"):
+                            event["room_id"] = payload["room_id"]
+                        _event_queue.put(event)
                     else:
                         _event_queue.put(payload)
             if proc.poll() is None:
@@ -1046,7 +1067,13 @@ def _poll_room_events(client: InterfaceClient, state: dict[str, Any]) -> list[di
             payload = client.events_list(room_id, since=since)
         except Exception:
             continue
-        events.extend(item for item in _as_list(payload, ("events", "data", "results")) if isinstance(item, dict))
+        for item in _as_list(payload, ("events", "data", "results")):
+            if not isinstance(item, dict):
+                continue
+            event = dict(item)
+            if not event.get("room_id") and not event.get("roomId"):
+                event["room_id"] = room_id
+            events.append(event)
     return events
 
 

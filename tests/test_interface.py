@@ -117,6 +117,36 @@ class InterfaceStateTest(unittest.TestCase):
         self.assertEqual(state["contacts"]["remote-si"]["contact_type"], "silicon")
         self.assertEqual(state["contacts"]["remote-si"]["display_name"], "Remote Si")
 
+    def test_room_discovery_accepts_direct_room_peers(self):
+        class FakeClient:
+            def whoami(self):
+                return {"silicon_id": "self-si"}
+
+            def rooms_list(self):
+                return [
+                    {
+                        "room_id": "room-carbon",
+                        "kind": "direct",
+                        "peers": [
+                            {
+                                "kind": "carbon",
+                                "id": "saket",
+                                "handle": "saket",
+                                "name": "Saket",
+                            }
+                        ],
+                    }
+                ]
+
+            def room_members(self, room_id):
+                raise AssertionError("peers should be enough for direct room discovery")
+
+        state = interface.discover_rooms(FakeClient(), force=True)
+
+        self.assertEqual(state["rooms"]["room-carbon"], "saket")
+        self.assertEqual(state["contacts"]["saket"]["contact_type"], "carbon")
+        self.assertEqual(state["contacts"]["saket"]["display_name"], "Saket")
+
     def test_incoming_event_includes_nested_reply_takeback_and_marks_read(self):
         interface.upsert_contact("carbon", "carbon-a", room_id="room-a")
         calls = []
@@ -144,6 +174,31 @@ class InterfaceStateTest(unittest.TestCase):
         self.assertIn("reply_to: evt-0", context)
         self.assertIn("take_back_request_id: tb-1", context)
         self.assertEqual(calls, [("read", "room-a", "evt-1")])
+
+    def test_polled_events_are_stamped_with_public_room_id(self):
+        interface.upsert_contact("carbon", "carbon-a", room_id="room-a")
+
+        class FakeClient:
+            def events_list(self, room_id, since=""):
+                return [
+                    {
+                        "type": "m.text",
+                        "event_id": "evt-1",
+                        "room": 10,
+                        "content": {"body": "hello"},
+                    }
+                ]
+
+            def read(self, room_id, event_id):
+                pass
+
+        events = interface._poll_room_events(FakeClient(), interface.get_contacts())
+
+        self.assertEqual(events[0]["room_id"], "room-a")
+        self.assertEqual(
+            interface.process_incoming_event(events[0], client=FakeClient())[0],
+            "carbon-a",
+        )
 
     def test_ignored_events_update_local_watermark(self):
         interface.upsert_contact("carbon", "carbon-a", room_id="room-a")
@@ -238,6 +293,28 @@ class InterfaceClientTest(unittest.TestCase):
             self.assertIn([str(exe), "--json", "crons", "delete", "cron-1"], commands)
             self.assertTrue(any(cmd[:5] == [str(exe), "--json", "crons", "create", "--trigger"] for cmd in commands))
             self.assertTrue(any(cmd[:4] == [str(exe), "--json", "crons", "update"] and "--active" in cmd for cmd in commands))
+
+    def test_cli_builds_current_interface_commands(self):
+        with tempfile.TemporaryDirectory() as td:
+            exe = Path(td) / "si"
+            exe.write_text("#!/bin/sh\n", encoding="utf-8")
+            exe.chmod(0o755)
+
+            completed = SimpleNamespace(returncode=0, stdout='{"members":[]}\n', stderr="")
+            with mock.patch("subprocess.run", return_value=completed) as run:
+                client = interface.InterfaceClient(executable=str(exe), cwd=Path(td))
+                client.whoami()
+                client.room_members("room-1")
+                client.ensure_direct_room("carbon", "saket")
+                client.events_list("room-1", since="evt-1")
+                client.progress("room-1", "manager", "thinking", "running")
+
+            commands = [call.args[0] for call in run.call_args_list]
+            self.assertIn([str(exe), "--json", "me"], commands)
+            self.assertIn([str(exe), "--json", "rooms", "show", "room-1", "--limit", "0"], commands)
+            self.assertIn([str(exe), "--json", "rooms", "direct", "carbon", "saket"], commands)
+            self.assertIn([str(exe), "--json", "messages", "list", "room-1", "--limit", "200"], commands)
+            self.assertIn([str(exe), "--json", "progress", "room-1", "thinking", "--group", "manager", "--note", "running"], commands)
 
     def test_json_parser_uses_last_json_line(self):
         self.assertEqual(interface._parse_json_output("noise\n{\"ok\": true}\n"), {"ok": True})
