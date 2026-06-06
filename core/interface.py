@@ -648,12 +648,19 @@ def ensure_contact_for_target(contact_type: str, fixed_id: str, client: Interfac
         payload = client.ensure_direct_room(contact_type, fixed_id)
         if isinstance(payload, dict):
             room_id = str(payload.get("room_id") or payload.get("roomId") or payload.get("id") or "")
-    except InterfaceError:
-        raise
-    except Exception:
-        room_id = ""
-    contact, _ = upsert_contact(contact_type, fixed_id, room_id=room_id, display_name=fixed_id)
-    return contact
+    except InterfaceError as exc:
+        raise InterfaceError(f"Could not open DM with {contact_type} '{fixed_id}': {exc}") from exc
+    except Exception as exc:
+        raise InterfaceError(f"Could not open DM with {contact_type} '{fixed_id}': {exc}") from exc
+
+    if not room_id:
+        raise InterfaceError(f"Could not open DM with {contact_type} '{fixed_id}': no DM id returned")
+
+    try:
+        contact, _ = upsert_contact(contact_type, fixed_id, room_id=room_id, display_name=fixed_id)
+        return contact
+    except Exception as exc:
+        raise InterfaceError(f"Could not save DM contact for {contact_type} '{fixed_id}': {exc}") from exc
 
 
 def _contact_for_room(room_id: str, client: InterfaceClient | None = None) -> tuple[str, dict[str, Any] | None, bool]:
@@ -1216,7 +1223,7 @@ def _contact_room_or_error(contact_id: str) -> tuple[dict[str, Any] | None, str]
     if not contact:
         return None, f"Error: contact '{contact_id}' not found"
     if not contact.get("room_id"):
-        return None, f"Error: contact '{contact_id}' has no Interface room_id"
+        return None, f"Error: contact '{contact_id}' has no Interface DM"
     return contact, ""
 
 

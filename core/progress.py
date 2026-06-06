@@ -292,25 +292,18 @@ def progress_display_line(event):
         return f"writing file: {compact(target, 160)}"
 
     if kind == EXECUTING:
-        if status == "output":
-            return f"executing output: {event.get('preview', '')}"
-        tool_name = event.get("tool_name") or ""
-        command = event.get("command") or event.get("preview") or ""
-        if status == "completed":
-            if command:
-                bits = [f"executing done: {compact(command, 120)}"]
-            elif tool_name:
-                bits = [f"tool done: {compact(tool_name, 120)}"]
-            else:
-                bits = ["tool done"]
-            if event.get("exit_code") is not None:
-                bits.append(f"exit={event.get('exit_code')}")
-            if event.get("preview"):
-                bits.append(f"output={event.get('preview')}")
-            return " ".join(bits)
-        if tool_name and not command:
-            return f"called tool: {compact(tool_name, 160)}"
-        return f"executing: {compact(command, 160)}"
+        failed = event.get("is_error") or status == "error"
+        exit_code = event.get("exit_code")
+        if exit_code is not None:
+            try:
+                failed = failed or int(exit_code) != 0
+            except (TypeError, ValueError):
+                failed = True
+        if failed:
+            output = event.get("error") or event.get("preview") or event.get("output") or ""
+            suffix = f": {compact(output, 180)}" if output else ""
+            return f"executing command failed{suffix}"
+        return "executing command"
 
     if kind == SEARCHING_WEB:
         target = event.get("query") or event.get("preview") or ""

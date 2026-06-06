@@ -63,6 +63,36 @@ class ManagerToolExecutionTest(unittest.TestCase):
         self.assertIn("Tool 'worker/new' (browser, public-research): Done. started", result)
         self.assertIn("checkback in 5 min", result)
 
+    def test_message_manager_failure_reports_progress_and_output(self):
+        spec = {
+            "tool": "message_manager",
+            "carbon_id": "missing-carbon",
+            "message": "hello",
+        }
+
+        with (
+            mock.patch.object(main, "ensure_contact_for_target", side_effect=Exception("api 404: Target not found.")),
+            mock.patch.object(main, "send_manager_message") as send_manager_message,
+            mock.patch.object(main, "send_progress") as send_progress,
+        ):
+            result = main.execute_single_tool(spec, "carbon-a")
+
+        send_manager_message.assert_not_called()
+        self.assertIn("Message failed: carbon 'missing-carbon' could not be reached.", result)
+        self.assertIn("api 404: Target not found.", result)
+        self.assertTrue(
+            any(
+                call.args
+                == (
+                    "carbon-a",
+                    "manager:carbon-a",
+                    "executing",
+                    "Message failed: carbon 'missing-carbon' could not be reached. api 404: Target not found.",
+                )
+                for call in send_progress.call_args_list
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

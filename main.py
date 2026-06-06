@@ -212,6 +212,12 @@ def _tool_progress_note(tool_spec):
     return f"called tool: {tool_name}"
 
 
+def _message_failure_status(carbon_id, target_kind, target_id, error):
+    message = f"Message failed: {target_kind} '{target_id}' could not be reached. {error}"
+    send_progress(carbon_id, f"manager:{carbon_id}", "executing", message)
+    return message
+
+
 def execute_single_tool(tool_spec, carbon_id):
     """Execute a single tool. Returns result string or None for do_nothing."""
     tool_name = tool_spec.get("tool", "")
@@ -239,7 +245,8 @@ def execute_single_tool(tool_spec, carbon_id):
             try:
                 contact = ensure_contact_for_target("carbon", target_carbon_id)
             except Exception as e:
-                return f"Tool 'message_manager' (to {target_carbon_id}): Error: {e}"
+                status = _message_failure_status(carbon_id, "carbon", target_carbon_id, e)
+                return f"Tool 'message_manager' (to {target_carbon_id}): Error: {status}"
             target_id = contact.get("carbon_id") or target_carbon_id
             status = send_manager_message(carbon_id, target_id, message)
             return f"Tool 'message_manager' (to {target_id}): {status}"
@@ -248,7 +255,8 @@ def execute_single_tool(tool_spec, carbon_id):
             try:
                 contact = ensure_contact_for_target("silicon", target_silicon_id)
             except Exception as e:
-                return f"Tool 'message_manager' (to {target_silicon_id}): Error: {e}"
+                status = _message_failure_status(carbon_id, "silicon", target_silicon_id, e)
+                return f"Tool 'message_manager' (to {target_silicon_id}): Error: {status}"
             target_id = contact.get("silicon_id") or target_silicon_id
             status = send_manager_message(carbon_id, target_id, message)
             return f"Tool 'message_manager' (to {target_id}): {status}"

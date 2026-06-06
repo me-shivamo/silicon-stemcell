@@ -65,6 +65,17 @@ class InterfaceStateTest(unittest.TestCase):
         self.assertEqual(contact["silicon_id"], "si-remote")
         self.assertEqual(interface.get_contacts()["rooms"]["room-si"], "si-remote")
 
+    def test_dm_creation_failure_does_not_create_dead_contact(self):
+        class FakeClient:
+            def ensure_direct_room(self, contact_type, fixed_id):
+                raise RuntimeError("api 404: Target not found.")
+
+        with self.assertRaisesRegex(interface.InterfaceError, "Could not open DM"):
+            interface.ensure_contact_for_target("carbon", "missing-carbon", client=FakeClient())
+
+        state = interface.get_contacts()
+        self.assertNotIn("missing-carbon", state["contacts"])
+
     def test_room_discovery_creates_direct_contact_mapping(self):
         class FakeClient:
             def whoami(self):
