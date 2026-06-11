@@ -1,8 +1,11 @@
-"""Hourly silicon system update checks.
+"""Hourly silicon system update checks + the brain-driven apply.
 
-The updater does not mutate the codebase directly. It fetches the latest Glass
-release metadata, compares it with ``silicon.info``, and asks the head manager to
-apply the update when the local version is behind.
+The updater does not mutate the codebase mechanically. It fetches the latest
+Glass release metadata, compares it with ``silicon.info``, and when the local
+version is behind it spawns a dedicated, detached **update brain** (its own
+claude session, no permission prompts — the same way the silicon itself is
+initiated) which diffs the codebases, reads the release description, applies
+the update, and bumps ``silicon.info`` to the exact new version.
 """
 from __future__ import annotations
 
@@ -250,40 +253,65 @@ def _latest_version_id(latest: dict[str, Any]) -> str:
     return str(latest.get("version_id") or latest.get("version") or "").strip()
 
 
-def _head_manager_contact_id() -> str:
-    from core.interface import get_contacts
-
-    contacts = get_contacts().get("contacts", {})
-    if not isinstance(contacts, dict):
-        return ""
-    for key, info in contacts.items():
-        if not isinstance(info, dict) or not info.get("is_central_carbon"):
-            continue
-        return str(info.get("carbon_id") or info.get("fixed_id") or key).strip()
-    return ""
-
-
 def _update_message(latest: dict[str, Any], latest_version_number: str) -> str:
     update_description = str(latest.get("description") or "").strip()
     codebase_link = str(
         latest.get("codebase_url") or latest.get("codebase_link") or latest.get("download_url") or ""
     ).strip()
     return (
-        "There has been a silicon system update, the updated version is: "
-        f"{latest_version_number}. Once the codebase has been updated with the new version, "
-        "update the version in silicon.info file with the new version, and that version number exactly! \n"
-        "The basic overview of the entire update is:\n"
+        "There has been a silicon system update. The updated version is: "
+        f"{latest_version_number}. Your current version is in silicon.info.\n\n"
+        "Just do a simple diff between the codebases and refer to the description "
+        "below to understand the update, then update yourself to the latest version.\n\n"
+        "The description of the update is:\n"
         f"{update_description}\n\n"
-        "And the codebase is:\n"
+        "And the latest codebase is:\n"
         f"{codebase_link}\n\n"
-        "Use the codebase link as your base structure and impliment it all exactly the way it's done "
-        "in the codebase. Make all the required decisions, and once the update is successfully done "
-        f"update the version number in silicon.info file with {latest_version_number}. \n"
+        "Download it, diff it against your current files, and apply the changes — "
+        "preserving your own memory, prompts, env.py, .glass.json, and local state. "
+        "Make all the required decisions yourself. Once the update is successfully "
+        "done, update the version number in the silicon.info file to exactly "
+        f"{latest_version_number}.\n"
     )
 
 
+def _apply_in_progress(state: dict[str, Any]) -> bool:
+    """True when a previously spawned update brain is still alive."""
+    pid = int(state.get("apply_pid") or 0)
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _spawn_update_brain() -> int:
+    """Launch ``update.py apply`` fully detached, so the update brain survives
+    even if the silicon restarts itself mid-update. Returns the pid."""
+    import subprocess
+    import sys
+
+    log_path = PROJECT_ROOT / "core" / "interface_state" / "system_update.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(log_path, "ab") as log:
+        proc = subprocess.Popen(
+            [sys.executable, str(PROJECT_ROOT / "update.py"), "apply"],
+            cwd=str(PROJECT_ROOT),
+            stdout=log,
+            stderr=log,
+            start_new_session=True,
+        )
+    return proc.pid
+
+
 def check_for_system_update(now: float | None = None) -> dict[str, str]:
-    """Return a manager context when a new system version is available."""
+    """Check Glass for a newer release; spawn the update brain when behind.
+
+    Returns {} always — the update no longer rides a contact manager session;
+    it runs in its own detached brain with no permission prompts.
+    """
     now = time.time() if now is None else now
     state = _read_json(UPDATE_STATE_FILE, {"version": 1})
     last_checked = float(state.get("last_checked_at") or 0)
@@ -311,23 +339,24 @@ def check_for_system_update(now: float | None = None) -> dict[str, str]:
     state.update({"local_version": local_version, "latest_seen_version": latest_version, "last_error": ""})
 
     if not latest_version or latest_version == local_version:
-        state["last_notified_version"] = ""
+        state["last_triggered_version"] = ""
         _write_json(UPDATE_STATE_FILE, state)
         return {}
 
-    if state.get("last_notified_version") == latest_version:
+    already_triggered = state.get("last_triggered_version") or state.get("last_notified_version")
+    if already_triggered == latest_version or _apply_in_progress(state):
         _write_json(UPDATE_STATE_FILE, state)
         return {}
 
-    head_contact_id = _head_manager_contact_id()
-    if not head_contact_id:
-        state["last_error"] = "No central carbon contact found for system update notification."
-        _write_json(UPDATE_STATE_FILE, state)
-        return {}
-
-    state["last_notified_version"] = latest_version
+    state["last_triggered_version"] = latest_version
+    state["apply_pid"] = _spawn_update_brain()
     _write_json(UPDATE_STATE_FILE, state)
-    return {head_contact_id: _update_message(latest, latest_version)}
+    print(
+        f"[Update] {local_version or '?'} → {latest_version}: update brain spawned "
+        f"(pid {state['apply_pid']})",
+        flush=True,
+    )
+    return {}
 
 
 def trigger_system_update_check(*, force: bool = True) -> dict[str, str]:
@@ -336,14 +365,105 @@ def trigger_system_update_check(*, force: bool = True) -> dict[str, str]:
     return check_for_system_update(now=now)
 
 
+# ---------------------------------------------------------------------------
+# The update brain — a dedicated claude session that manages the whole update.
+# Runs in its own detached process (see _spawn_update_brain), exactly like the
+# silicon is initiated: no permission prompts, its own session, full autonomy.
+# ---------------------------------------------------------------------------
+def _claude_cmd() -> str:
+    import platform
+    import shutil as _shutil
+
+    if platform.system() == "Windows":
+        return _shutil.which("claude") or _shutil.which("claude.cmd") or "claude"
+    return "claude"
+
+
+def _run_update_brain_once(cmd: list[str], message: str) -> int:
+    import subprocess
+
+    proc = subprocess.run(
+        cmd,
+        input=message,
+        text=True,
+        cwd=str(PROJECT_ROOT),
+        timeout=2 * 60 * 60,
+    )
+    return proc.returncode
+
+
+def apply_update() -> int:
+    """Fetch the latest release and hand the whole update to the update brain."""
+    import uuid
+
+    from prompts.DNA import get_update_prompt
+
+    latest = _fetch_latest_version()
+    if not latest:
+        print("[Update] No published version to apply.", flush=True)
+        return 0
+    latest_version = _latest_version_id(latest)
+    local_version = _local_version()
+    if not latest_version or latest_version == local_version:
+        print(f"[Update] Already on {local_version or 'unversioned'} — nothing to apply.", flush=True)
+        return 0
+
+    message = _update_message(latest, latest_version)
+    prompt_file = PROJECT_ROOT / "sessions" / "system_update_prompt.md"
+    prompt_file.parent.mkdir(parents=True, exist_ok=True)
+    prompt_file.write_text(get_update_prompt(), encoding="utf-8")
+
+    state = _read_json(UPDATE_STATE_FILE, {"version": 1})
+    session_id = str(state.get("brain_session_id") or "").strip()
+    base = [
+        _claude_cmd(), "-p",
+        "--system-prompt-file", str(prompt_file),
+        "--dangerously-skip-permissions",
+    ]
+
+    print(f"[Update] Applying {local_version or '?'} → {latest_version} via update brain…", flush=True)
+    rc = -1
+    if session_id:
+        rc = _run_update_brain_once(base + ["--resume", session_id], message)
+    if rc != 0:
+        session_id = str(uuid.uuid4())
+        state["brain_session_id"] = session_id
+        _write_json(UPDATE_STATE_FILE, state)
+        rc = _run_update_brain_once(base + ["--session-id", session_id], message)
+
+    after = _local_version()
+    state = _read_json(UPDATE_STATE_FILE, {"version": 1})
+    state.update({"apply_pid": 0, "local_version": after, "last_apply_rc": rc})
+    _write_json(UPDATE_STATE_FILE, state)
+    if after == latest_version:
+        print(f"[Update] Done — now on {after}.", flush=True)
+    else:
+        print(
+            f"[Update] Brain finished (rc={rc}) but silicon.info reports "
+            f"{after or 'unversioned'} (expected {latest_version}).",
+            flush=True,
+        )
+    return 0 if after == latest_version else (rc or 1)
+
+
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Trigger a silicon system update check.")
+    parser = argparse.ArgumentParser(description="Silicon system update check / apply.")
+    parser.add_argument(
+        "command",
+        nargs="?",
+        choices=["check", "apply"],
+        default="check",
+        help="check: compare versions and spawn the update brain if behind (default). "
+        "apply: run the update brain in this process.",
+    )
     parser.add_argument(
         "--no-force",
         action="store_true",
         help="Respect the hourly throttle instead of forcing the check.",
     )
     args = parser.parse_args(argv)
+    if args.command == "apply":
+        return apply_update()
     result = trigger_system_update_check(force=not args.no_force)
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0

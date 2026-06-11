@@ -162,6 +162,21 @@ def get_manager_prompt(carbon_id):
     return "\n\n".join(p for p in parts if p)
 
 
+def get_update_prompt():
+    """System prompt for the dedicated update brain — assembled like the
+    manager prompt (so the brain knows who this silicon is), but pointed at
+    prompts/UPDATE.md instead of any contact session."""
+    parts = [
+        _read_prompt("DNA.py"),
+        _read_prompt("SOUL.md"),
+        _read_prompt("SILICON.md"),
+        _glass_profile_section(),
+        _read_prompt("MEMORY.md"),
+        _read_prompt("UPDATE.md"),
+    ]
+    return "\n\n".join(p for p in parts if p)
+
+
 def get_worker_prompt(worker_type):
     """Build the system prompt for a specific worker type.
     worker_type must be one of: browser, terminal, writer.

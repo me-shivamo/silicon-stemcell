@@ -123,9 +123,23 @@ def execute_command(command: dict, root: Path, name: str) -> tuple[str, str]:
             return "done", "stopped"
         except Exception as exc:
             return "failed", str(exc)
+    if action in {"fetch_latest", "update_check"}:
+        # Brain-driven update: force the version check now. When behind, it
+        # spawns the detached update brain which manages the whole sequence
+        # itself (diff, apply, bump silicon.info) — works while running.
+        try:
+            proc = subprocess.run(
+                ["silicon", "update", "check", name],
+                capture_output=True, text=True, timeout=180,
+            )
+            output = proc.stdout.strip() or proc.stderr.strip()
+            return ("done" if proc.returncode == 0 else "failed"), output or "update check triggered"
+        except Exception as exc:
+            return "failed", str(exc)
     if action == "update":
-        # A running silicon is stopped for the update and restarted after, so
-        # Glass can push a release to the whole fleet in one go.
+        # Legacy mechanical update (CLI merge). A running silicon is stopped
+        # for the update and restarted after, so Glass can push a release to
+        # the whole fleet in one go.
         was_running = detect_status(root) == "running"
         if was_running:
             try:

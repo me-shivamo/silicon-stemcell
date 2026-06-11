@@ -43,7 +43,7 @@ class SystemUpdateTest(unittest.TestCase):
             setattr(update, key, value)
         self.tmp.cleanup()
 
-    def test_update_mismatch_notifies_head_once_per_version(self):
+    def test_update_mismatch_spawns_brain_once_per_version(self):
         update.SILICON_INFO_FILE.write_text('{"version": "1.0"}\n', encoding="utf-8")
         latest = {
             "version_id": "1.1",
@@ -52,16 +52,37 @@ class SystemUpdateTest(unittest.TestCase):
         }
 
         with mock.patch.object(update, "_fetch_latest_version", return_value=latest), mock.patch.object(
-            update, "_head_manager_contact_id", return_value="carbon-a"
-        ):
+            update, "_spawn_update_brain", return_value=12345
+        ) as spawn, mock.patch.object(update, "_apply_in_progress", return_value=False):
             first = update.check_for_system_update(now=4000)
             second = update.check_for_system_update(now=8000)
 
-        self.assertIn("carbon-a", first)
-        self.assertIn("updated version is: 1.1", first["carbon-a"])
-        self.assertIn("new tools", first["carbon-a"])
-        self.assertIn("https://glass.example/codebase.zip", first["carbon-a"])
+        # The update never rides a contact session — it spawns its own brain.
+        self.assertEqual(first, {})
         self.assertEqual(second, {})
+        spawn.assert_called_once()
+        state = update._read_json(update.UPDATE_STATE_FILE, {})
+        self.assertEqual(state["last_triggered_version"], "1.1")
+        self.assertEqual(state["apply_pid"], 12345)
+
+    def test_update_brain_message_is_diff_based(self):
+        msg = update._update_message(
+            {"description": "new tools", "codebase_url": "https://glass.example/codebase.zip"},
+            "1.1",
+        )
+        self.assertIn("simple diff", msg)
+        self.assertIn("new tools", msg)
+        self.assertIn("https://glass.example/codebase.zip", msg)
+        self.assertIn("exactly 1.1", msg)
+
+    def test_up_to_date_does_not_spawn(self):
+        update.SILICON_INFO_FILE.write_text('{"version": "1.1"}\n', encoding="utf-8")
+        latest = {"version_id": "1.1", "description": "same", "codebase_url": "x"}
+        with mock.patch.object(update, "_fetch_latest_version", return_value=latest), mock.patch.object(
+            update, "_spawn_update_brain"
+        ) as spawn:
+            update.check_for_system_update(now=4000)
+        spawn.assert_not_called()
 
     def test_fetch_latest_requests_and_stores_auth_key_when_missing(self):
         update.DOTENV_FILE.write_text("GLASS_SERVER_URL=https://glass.example\n", encoding="utf-8")
