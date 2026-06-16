@@ -296,9 +296,12 @@ def _run_resolver(conflicted: list[str], notes: str, globs: list[str]) -> bool:
     for cmd in attempts:
         try:
             log(f"resolving conflicts with: {cmd[0]}")
-            subprocess.run(cmd, cwd=str(PROJECT_ROOT), capture_output=True, text=True, timeout=1800)
+            # Bounded so a stuck/hung resolver can't stall a fleet rollout — a
+            # real conflict resolve takes a minute or two; on timeout we fall
+            # through to the next brain, then to a safe merge --abort.
+            subprocess.run(cmd, cwd=str(PROJECT_ROOT), capture_output=True, text=True, timeout=300)
         except Exception as exc:  # noqa: BLE001
-            log(f"{cmd[0]} resolver failed: {exc}")
+            log(f"{cmd[0]} resolver failed/timeout: {exc}")
             continue
         if not _markers_remain(conflicted):
             return True
