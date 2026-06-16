@@ -38,8 +38,10 @@ FETCH_URL = os.environ.get(
     "SILICON_REPO_URL", "https://github.com/unlikefraction/silicon-stemcell.git"
 )
 MANIFEST = ".backupsilicon"
-# Identity is per-install and must never be clobbered by an update.
-ALWAYS_PROTECTED = ("silicon.json",)
+# Per-install identity + secrets that must never be tracked, clobbered, or
+# deleted by an update. .glass.json carries the silicon's auth key/id; .env its
+# local secrets; silicon.json its identity (name/brain).
+ALWAYS_PROTECTED = ("silicon.json", ".glass.json", ".env")
 _GITIGNORE_BEGIN = "# >>> silicon-managed (auto-synced from .backupsilicon) >>>"
 _GITIGNORE_END = "# <<< silicon-managed <<<"
 
@@ -322,8 +324,11 @@ def git_apply() -> dict:
     before = _local_version()
     try:
         # Snapshot the Silicon's own code changes so the merge preserves them.
-        if _git("status", "--porcelain").stdout.strip():
-            _git("add", "-A")
+        # `add -u` stages modifications to ALREADY-TRACKED files only — never
+        # untracked per-install secrets/dotfiles (.glass.json, .env, …), which
+        # must not be committed (else a later reset would delete them).
+        if _git("status", "--porcelain", "--untracked-files=no").stdout.strip():
+            _git("add", "-u")
             _git("commit", "-m", f"silicon: local changes before update {int(time.time())}")
 
         # Already current?
