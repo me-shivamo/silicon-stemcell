@@ -6,18 +6,73 @@ backups when Glass asks for them.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import pty
+import re
+import secrets
+import shlex
 import signal
+import shutil
 import ssl
 import subprocess
 import sys
+import tarfile
+import tempfile
+import threading
 import time
+from datetime import datetime, timezone
+from importlib import metadata as importlib_metadata
 from pathlib import Path
+from urllib.parse import quote
+from urllib.request import Request, urlopen
 
 STATUS_INTERVAL = 15
 PING_INTERVAL = 20
 MAX_BACKOFF = 30
+REGISTRY_TIMEOUT = 8
+GLASS_CLI_REPO = (
+    os.environ.get("SILICON_GLASS_CLI_REPO")
+    or os.environ.get("GLASS_CLI_REPO")
+    or "unlikefraction/glass"
+)
+NPM_RUNTIME_PACKAGES = (
+    {"name": "@anthropic-ai/claude-code", "command": "claude"},
+    {"name": "@openai/codex", "command": "codex"},
+    {"name": "silicon-browser", "command": "silicon-browser"},
+)
+LOCAL_NPM_CLIS = (
+    {
+        "name": "@teamofsilicons/silicon-interface-cli",
+        "label": "silicon-interface",
+        "commands": (".silicon-interface/bin/si", "si", "silicon-interface"),
+        "install_command": "silicon-interface",
+    },
+)
+SCRIPT_CLIS = (
+    {
+        "name": "silicon",
+        "command": "silicon",
+        "source": "silicon CLI",
+        "package": "silicon-cli",
+        "update_args": ("script", "update"),
+    },
+    {
+        "name": "glass",
+        "command": "glass",
+        "source": "Glass CLI",
+        "latest_repo": GLASS_CLI_REPO,
+        "update_kind": "glass_cli",
+    },
+)
+TERMINAL_COMMANDS = {
+    "claude": ("claude",),
+    "codex": ("codex", "login"),
+}
+SEND_LOCK = threading.Lock()
+TERMINAL_LOCK = threading.Lock()
+TERMINAL_SESSION: dict[str, object] = {}
 
 
 def silicon_dir() -> Path:
@@ -85,7 +140,12 @@ def detect_status(root: Path) -> str:
 
 
 def send_json(ws, payload: dict) -> None:
-    ws.send(json.dumps(payload, separators=(",", ":")))
+    with SEND_LOCK:
+        ws.send(json.dumps(payload, separators=(",", ":")))
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 def status_payload(root: Path) -> dict:
@@ -107,6 +167,657 @@ def run_backup(root: Path, note: str = "glass command") -> tuple[str, str]:
         return "failed", str(exc)
 
 
+def _request_json(url: str) -> dict:
+    req = Request(url, headers={"User-Agent": "silicon-glass-agent/1.0"})
+    with urlopen(req, timeout=REGISTRY_TIMEOUT) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def _latest_pypi_version(name: str) -> tuple[str, str]:
+    try:
+        body = _request_json(f"https://pypi.org/pypi/{quote(name)}/json")
+        return str((body.get("info") or {}).get("version") or ""), ""
+    except Exception as exc:
+        return "", str(exc)
+
+
+def _latest_npm_version(name: str) -> tuple[str, str]:
+    try:
+        body = _request_json(f"https://registry.npmjs.org/{quote(name, safe='')}/latest")
+        return str(body.get("version") or ""), ""
+    except Exception as exc:
+        return "", str(exc)
+
+
+def _latest_github_main(repo: str) -> tuple[str, str]:
+    try:
+        body = _request_json(f"https://api.github.com/repos/{repo}/commits/main")
+        sha = str(body.get("sha") or "")
+        return (f"main@{sha[:12]}" if sha else ""), ""
+    except Exception as exc:
+        return "", str(exc)
+
+
+def _requirement_name(line: str) -> str:
+    line = (line or "").split("#", 1)[0].split(";", 1)[0].strip()
+    if not line or line.startswith(("-", "git+", "http://", "https://")):
+        return ""
+    match = re.match(r"^([A-Za-z0-9_.-]+)(?:\[.*?\])?", line)
+    return match.group(1) if match else ""
+
+
+def _python_requirements(root: Path) -> list[tuple[str, str]]:
+    req = root / "requirements.txt"
+    if not req.exists():
+        return []
+    out: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for raw in req.read_text(encoding="utf-8").splitlines():
+        name = _requirement_name(raw)
+        key = name.lower().replace("_", "-")
+        if name and key not in seen:
+            seen.add(key)
+            out.append((name, raw.strip()))
+    return out
+
+
+def _installed_python_version(name: str) -> str:
+    try:
+        return importlib_metadata.version(name)
+    except importlib_metadata.PackageNotFoundError:
+        return ""
+
+
+def _npm_global_versions() -> tuple[dict[str, str], str]:
+    npm = shutil.which("npm")
+    if not npm:
+        return {}, "npm not found"
+    try:
+        proc = subprocess.run(
+            [npm, "list", "-g", "--depth=0", "--json"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        body = json.loads(proc.stdout or "{}")
+        deps = body.get("dependencies") or {}
+        return {
+            name: str((info or {}).get("version") or "")
+            for name, info in deps.items()
+            if isinstance(info, dict)
+        }, ""
+    except Exception as exc:
+        return {}, str(exc)
+
+
+def _version_from_command(command: str) -> str:
+    exe = command if os.path.sep in command else shutil.which(command)
+    if not exe:
+        return ""
+    try:
+        proc = subprocess.run(
+            [exe, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except Exception:
+        return ""
+    text = (proc.stdout or proc.stderr or "").strip().splitlines()
+    if not text:
+        return ""
+    match = re.search(r"\d+(?:\.\d+)+(?:[-+][A-Za-z0-9_.-]+)?", text[0])
+    return match.group(0) if match else text[0][:80]
+
+
+def _python_console_package_version(root: Path, command: str, package: str) -> str:
+    exe = _resolve_command(root, command)
+    if not exe:
+        return ""
+    try:
+        first_line = Path(exe).read_bytes()[:256].splitlines()[0].decode("utf-8", errors="ignore")
+    except Exception:
+        first_line = ""
+
+    code = (
+        "from importlib.metadata import PackageNotFoundError, version\n"
+        f"try: print(version({package!r}))\n"
+        "except PackageNotFoundError: pass\n"
+    )
+    if first_line.startswith("#!") and "python" in first_line.lower():
+        try:
+            parts = shlex.split(first_line[2:].strip())
+        except ValueError:
+            parts = first_line[2:].strip().split()
+        if parts:
+            runner = parts[:]
+            if Path(runner[0]).name == "env" and len(runner) == 1:
+                runner.append("python3")
+            try:
+                proc = subprocess.run(
+                    [*runner, "-c", code],
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                )
+                text = (proc.stdout or "").strip().splitlines()
+                if proc.returncode == 0 and text:
+                    return text[0]
+            except Exception:
+                pass
+
+    return _installed_python_version(package)
+
+
+def _resolve_command(root: Path, command: str) -> str:
+    path = root / command
+    if os.path.sep in command and path.exists():
+        return str(path)
+    found = shutil.which(command)
+    return found or ""
+
+
+def _file_identity(path: str) -> str:
+    if not path:
+        return ""
+    try:
+        p = Path(path)
+        if not p.exists() or not p.is_file():
+            return ""
+        digest = hashlib.sha256(p.read_bytes()).hexdigest()[:12]
+        return f"sha256:{digest}"
+    except Exception:
+        return ""
+
+
+def _command_identity(root: Path, command: str) -> str:
+    exe = _resolve_command(root, command)
+    if not exe:
+        return ""
+    return _version_from_command(exe) or _file_identity(exe)
+
+
+def _dependency_status(installed: str, latest: str) -> str:
+    if not installed:
+        return "missing"
+    if latest and latest != installed:
+        return "outdated"
+    if latest:
+        return "current"
+    return "unknown"
+
+
+def dependency_report(root: Path) -> dict:
+    packages: list[dict] = []
+    errors: list[str] = []
+
+    for name, required in _python_requirements(root):
+        installed = _installed_python_version(name)
+        latest, err = _latest_pypi_version(name)
+        if err:
+            errors.append(f"pypi:{name}: {err}")
+        packages.append(
+            {
+                "manager": "pip",
+                "name": name,
+                "required": required,
+                "installed_version": installed,
+                "latest_version": latest,
+                "status": _dependency_status(installed, latest),
+                "source": "requirements.txt",
+            }
+        )
+
+    npm_versions, npm_err = _npm_global_versions()
+    if npm_err:
+        errors.append(f"npm: {npm_err}")
+    for item in NPM_RUNTIME_PACKAGES:
+        name = item["name"]
+        installed = npm_versions.get(name) or _version_from_command(item["command"])
+        latest, err = _latest_npm_version(name)
+        if err:
+            errors.append(f"npm:{name}: {err}")
+        packages.append(
+            {
+                "manager": "npm",
+                "name": name,
+                "required": "global runtime",
+                "installed_version": installed,
+                "latest_version": latest,
+                "status": _dependency_status(installed, latest),
+                "source": "npm global",
+                "command": item["command"],
+            }
+        )
+
+    for item in LOCAL_NPM_CLIS:
+        name = item["name"]
+        exe = ""
+        installed = ""
+        for command in item["commands"]:
+            exe = _resolve_command(root, command)
+            if exe:
+                installed = _version_from_command(exe) or _file_identity(exe)
+                break
+        latest, err = _latest_npm_version(name)
+        if err:
+            errors.append(f"npm:{name}: {err}")
+        packages.append(
+            {
+                "manager": "npm",
+                "name": item["label"],
+                "package": name,
+                "required": "local runtime CLI",
+                "installed_version": installed,
+                "latest_version": latest,
+                "status": _dependency_status(installed, latest),
+                "source": ".silicon-interface",
+                "command": exe or item["commands"][0],
+            }
+        )
+
+    for item in SCRIPT_CLIS:
+        name = item["name"]
+        installed = ""
+        package = str(item.get("package") or "")
+        if package:
+            installed = _python_console_package_version(root, item["command"], package)
+        installed = installed or _command_identity(root, item["command"])
+        if package:
+            latest, err = _latest_pypi_version(package)
+        else:
+            latest, err = _latest_github_main(item["latest_repo"])
+        if err:
+            label = f"pypi:{package}" if package else f"github:{item['latest_repo']}"
+            errors.append(f"{label}: {err}")
+        if not installed:
+            status = "missing"
+        elif installed.startswith("sha256:"):
+            status = "unknown"
+        else:
+            status = _dependency_status(installed, latest)
+        packages.append(
+            {
+                "manager": "script",
+                "name": name,
+                "package": package,
+                "required": item["source"],
+                "installed_version": installed,
+                "latest_version": latest,
+                "status": status,
+                "source": item["source"],
+                "command": item["command"],
+            }
+        )
+
+    summary = {"total": len(packages), "current": 0, "outdated": 0, "missing": 0, "unknown": 0}
+    for pkg in packages:
+        summary[pkg["status"]] = summary.get(pkg["status"], 0) + 1
+
+    return {
+        "checked_at": now_iso(),
+        "packages": packages,
+        "summary": summary,
+        "errors": errors[:20],
+    }
+
+
+def _trim(text: str, limit: int = 500) -> str:
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[-limit:]
+
+
+def _run_install(cmd: list[str], root: Path, timeout: int = 900) -> dict:
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=str(root),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        detail = _trim(proc.stderr or proc.stdout or "")
+        return {
+            "command": " ".join(cmd),
+            "ok": proc.returncode == 0,
+            "returncode": proc.returncode,
+            "detail": detail,
+        }
+    except Exception as exc:
+        return {"command": " ".join(cmd), "ok": False, "returncode": None, "detail": str(exc)}
+
+
+def _install_glass_cli() -> dict:
+    command = f"install glass CLI from github:{GLASS_CLI_REPO}@main"
+    glass_dir = Path.home() / ".glass"
+    bin_dir = Path.home() / ".local" / "bin"
+    tmp = Path(tempfile.mkdtemp(prefix="glass-install-"))
+    try:
+        bin_dir.mkdir(parents=True, exist_ok=True)
+        archive = f"https://codeload.github.com/{GLASS_CLI_REPO}/tar.gz/refs/heads/main"
+        tarball = tmp / "glass.tar.gz"
+        req = Request(archive, headers={"User-Agent": "silicon-glass-agent/1.0"})
+        with urlopen(req, timeout=60) as resp, tarball.open("wb") as f:
+            shutil.copyfileobj(resp, f)
+        with tarfile.open(tarball) as tf:
+            tf.extractall(tmp)
+        src = next((p for p in tmp.iterdir() if p.is_dir() and p.name.startswith("glass-")), None)
+        if not src or not (src / "glass").exists():
+            return {"command": command, "ok": False, "returncode": None, "detail": "downloaded archive was invalid"}
+
+        shutil.rmtree(glass_dir, ignore_errors=True)
+        glass_dir.mkdir(parents=True, exist_ok=True)
+        for item in src.iterdir():
+            if item.name in {".git", "__pycache__"}:
+                continue
+            dest = glass_dir / item.name
+            if item.is_dir():
+                shutil.copytree(item, dest, dirs_exist_ok=True)
+            else:
+                shutil.copy2(item, dest)
+        os.chmod(glass_dir / "glass", 0o755)
+        wrapper = bin_dir / "glass"
+        if wrapper.exists() or wrapper.is_symlink():
+            wrapper.unlink()
+        wrapper.symlink_to(glass_dir / "glass")
+        return {"command": command, "ok": True, "returncode": 0, "detail": "glass CLI installed"}
+    except Exception as exc:
+        return {"command": command, "ok": False, "returncode": None, "detail": str(exc)}
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def update_dependencies(root: Path) -> dict:
+    install_results: list[dict] = []
+    req = root / "requirements.txt"
+    if req.exists():
+        attempts = [
+            [sys.executable, "-m", "pip", "install", "--upgrade", "-r", str(req)],
+            [sys.executable, "-m", "pip", "install", "--upgrade", "--user", "-r", str(req)],
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "--upgrade",
+                "--break-system-packages",
+                "-r",
+                str(req),
+            ],
+        ]
+        for cmd in attempts:
+            result = _run_install(cmd, root)
+            install_results.append(result)
+            if result["ok"]:
+                break
+
+    npm = shutil.which("npm")
+    if npm:
+        install_results.append(
+            _run_install(
+                [npm, "install", "-g", *(item["name"] for item in NPM_RUNTIME_PACKAGES)],
+                root,
+                timeout=1200,
+            )
+        )
+    else:
+        install_results.append(
+            {
+                "command": "npm install -g " + " ".join(item["name"] for item in NPM_RUNTIME_PACKAGES),
+                "ok": False,
+                "returncode": None,
+                "detail": "npm not found",
+            }
+        )
+
+    for item in LOCAL_NPM_CLIS:
+        if npm:
+            install_results.append(
+                _run_install(
+                    [
+                        npm,
+                        "exec",
+                        "--yes",
+                        "--package",
+                        item["name"],
+                        "--",
+                        item["install_command"],
+                        "install",
+                        str(root),
+                    ],
+                    root,
+                    timeout=1200,
+                )
+            )
+        else:
+            install_results.append(
+                {
+                    "command": f"npm exec --package {item['name']} -- {item['install_command']} install {root}",
+                    "ok": False,
+                    "returncode": None,
+                    "detail": "npm not found",
+                }
+            )
+
+    for item in SCRIPT_CLIS:
+        if item.get("update_kind") == "glass_cli":
+            install_results.append(_install_glass_cli())
+            continue
+        exe = _resolve_command(root, item["command"])
+        if exe:
+            install_results.append(
+                _run_install([exe, *item["update_args"]], root, timeout=900)
+            )
+        else:
+            install_results.append(
+                {
+                    "command": " ".join((item["command"], *item["update_args"])),
+                    "ok": False,
+                    "returncode": None,
+                    "detail": f"{item['command']} not found",
+                }
+            )
+
+    report = dependency_report(root)
+    report["updated_at"] = now_iso()
+    report["install_results"] = install_results
+    report["summary"]["failed_installs"] = sum(1 for r in install_results if not r.get("ok"))
+    return report
+
+
+def dependency_summary_text(report: dict, *, updated: bool = False) -> str:
+    summary = report.get("summary") or {}
+    total = int(summary.get("total") or 0)
+    outdated = int(summary.get("outdated") or 0)
+    missing = int(summary.get("missing") or 0)
+    failed = int(summary.get("failed_installs") or 0)
+    prefix = "dependency update" if updated else "dependency report"
+    detail = f"{prefix}: {total} checked, {outdated} outdated, {missing} missing"
+    if failed:
+        detail += f", {failed} install step(s) failed"
+    return detail
+
+
+def terminal_frame(ws, **payload) -> None:
+    send_json(ws, {"type": "terminal", **payload})
+
+
+def _terminal_reader(ws, session_id: str, provider: str, fd: int, proc: subprocess.Popen) -> None:
+    try:
+        while True:
+            try:
+                chunk = os.read(fd, 4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            terminal_frame(
+                ws,
+                event="output",
+                provider=provider,
+                session_id=session_id,
+                data=chunk.decode("utf-8", errors="replace"),
+            )
+    finally:
+        rc = proc.poll()
+        if rc is None:
+            try:
+                rc = proc.wait(timeout=1)
+            except Exception:
+                rc = None
+        with TERMINAL_LOCK:
+            current = TERMINAL_SESSION.get("id") == session_id
+            if current:
+                TERMINAL_SESSION.clear()
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        if current:
+            terminal_frame(
+                ws,
+                event="exit",
+                provider=provider,
+                session_id=session_id,
+                returncode=rc,
+            )
+
+
+def terminal_stop(ws=None, reason: str = "stopped") -> bool:
+    with TERMINAL_LOCK:
+        session = dict(TERMINAL_SESSION)
+        TERMINAL_SESSION.clear()
+    if not session:
+        return False
+
+    proc = session.get("proc")
+    if isinstance(proc, subprocess.Popen) and proc.poll() is None:
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except Exception:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+
+    fd = session.get("fd")
+    if isinstance(fd, int):
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+    if ws is not None:
+        terminal_frame(
+            ws,
+            event="stopped",
+            provider=str(session.get("provider") or ""),
+            session_id=str(session.get("id") or ""),
+            reason=reason,
+        )
+    return True
+
+
+def terminal_start(ws, root: Path, provider: str) -> None:
+    provider = (provider or "").strip().lower()
+    args = TERMINAL_COMMANDS.get(provider)
+    if not args:
+        terminal_frame(ws, event="error", provider=provider, message="unknown terminal provider")
+        return
+
+    exe = shutil.which(args[0])
+    if not exe:
+        terminal_frame(ws, event="error", provider=provider, message=f"{args[0]} not found")
+        return
+
+    terminal_stop(ws, reason="replaced")
+    try:
+        master_fd, slave_fd = pty.openpty()
+    except OSError as exc:
+        terminal_frame(ws, event="error", provider=provider, message=str(exc))
+        return
+
+    env = os.environ.copy()
+    env.setdefault("TERM", "xterm-256color")
+    cmd = [exe, *args[1:]]
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(root),
+            stdin=slave_fd,
+            stdout=slave_fd,
+            stderr=slave_fd,
+            env=env,
+            close_fds=True,
+            start_new_session=True,
+        )
+    except Exception as exc:
+        try:
+            os.close(master_fd)
+            os.close(slave_fd)
+        except OSError:
+            pass
+        terminal_frame(ws, event="error", provider=provider, message=str(exc))
+        return
+    try:
+        os.close(slave_fd)
+    except OSError:
+        pass
+
+    session_id = secrets.token_hex(8)
+    with TERMINAL_LOCK:
+        TERMINAL_SESSION.update(
+            {"id": session_id, "provider": provider, "proc": proc, "fd": master_fd}
+        )
+    terminal_frame(
+        ws,
+        event="started",
+        provider=provider,
+        session_id=session_id,
+        command=" ".join(args),
+    )
+    thread = threading.Thread(
+        target=_terminal_reader,
+        args=(ws, session_id, provider, master_fd, proc),
+        daemon=True,
+    )
+    thread.start()
+
+
+def terminal_input(ws, data: str) -> None:
+    with TERMINAL_LOCK:
+        session = dict(TERMINAL_SESSION)
+    fd = session.get("fd")
+    if not isinstance(fd, int):
+        terminal_frame(ws, event="error", message="no active terminal session")
+        return
+    try:
+        os.write(fd, str(data or "")[:4000].encode("utf-8", errors="replace"))
+    except OSError as exc:
+        terminal_frame(
+            ws,
+            event="error",
+            provider=str(session.get("provider") or ""),
+            session_id=str(session.get("id") or ""),
+            message=str(exc),
+        )
+
+
+def handle_terminal_message(ws, msg: dict, root: Path) -> None:
+    action = (msg.get("action") or "").strip().lower()
+    if action == "start":
+        terminal_start(ws, root, str(msg.get("provider") or ""))
+    elif action == "input":
+        terminal_input(ws, str(msg.get("data") or ""))
+    elif action == "stop":
+        if not terminal_stop(ws):
+            terminal_frame(ws, event="status", message="no active terminal session")
+    else:
+        terminal_frame(ws, event="error", message="unknown terminal action")
+
+
 def execute_command(command: dict, root: Path, name: str) -> tuple[str, str]:
     action = command.get("command", "")
     if action in {"backup", "backup_now"}:
@@ -126,6 +837,23 @@ def execute_command(command: dict, root: Path, name: str) -> tuple[str, str]:
     if action == "version":
         # Report the version this silicon is currently running (silicon.info).
         return "done", local_version(root) or "unversioned"
+    if action in {"dependencies", "dependency_report"}:
+        report = dependency_report(root)
+        command["_status_patch"] = {
+            "dependencies": report,
+            "dependency_check_at": report.get("checked_at"),
+        }
+        return "done", dependency_summary_text(report)
+    if action in {"dependency_update", "dependencies_update"}:
+        report = update_dependencies(root)
+        command["_status_patch"] = {
+            "dependencies": report,
+            "dependency_check_at": report.get("checked_at"),
+            "dependency_update_at": report.get("updated_at"),
+        }
+        failed = int((report.get("summary") or {}).get("failed_installs") or 0)
+        status = "failed" if failed else "done"
+        return status, dependency_summary_text(report, updated=True)
     if action in {"fetch_latest", "update_check", "update", "git_update"}:
         # Git-based, pull-only update: merge upstream while preserving the
         # silicon's own code + living data, then restart to load it. The version
@@ -175,6 +903,9 @@ def handle_message(ws, msg: dict, root: Path, name: str) -> None:
         return
     if msg_type == "pong":
         return
+    if msg_type == "terminal":
+        handle_terminal_message(ws, msg, root)
+        return
     if msg_type != "command":
         return
 
@@ -184,7 +915,11 @@ def handle_message(ws, msg: dict, root: Path, name: str) -> None:
     status, detail = execute_command(msg, root, name)
     # Keep Glass's stored status fresh — the console reads `version` from it
     # (the on-demand "version" command, and any command that may change it).
-    send_json(ws, {"type": "status", "version": local_version(root)})
+    status_update = {"type": "status", "version": local_version(root)}
+    patch = msg.pop("_status_patch", {})
+    if isinstance(patch, dict):
+        status_update.update(patch)
+    send_json(ws, status_update)
     if command_id:
         send_json(ws, {
             "type": "command_result",
@@ -202,40 +937,43 @@ def run_live(root: Path, config: dict, running: list[bool]) -> None:
     name = silicon_name(root)
     url = ws_url(config["server_url"], config["api_key"])
     print(f"[glass-agent] connecting to {config['server_url'].rstrip('/')}/ws/glass/agent/", flush=True)
-    with connect(url, close_timeout=5, open_timeout=10, ssl=ssl_context()) as ws:
-        print("[glass-agent] connected", flush=True)
-        send_json(ws, {
-            "type": "handshake",
-            "name": name,
-            "version": local_version(root),
-            "hostname": os.uname().nodename if hasattr(os, "uname") else "",
-            "pid": os.getpid(),
-        })
-        send_json(ws, status_payload(root))
-        next_status = time.time() + STATUS_INTERVAL
-        next_ping = time.time() + PING_INTERVAL
+    try:
+        with connect(url, close_timeout=5, open_timeout=10, ssl=ssl_context()) as ws:
+            print("[glass-agent] connected", flush=True)
+            send_json(ws, {
+                "type": "handshake",
+                "name": name,
+                "version": local_version(root),
+                "hostname": os.uname().nodename if hasattr(os, "uname") else "",
+                "pid": os.getpid(),
+            })
+            send_json(ws, status_payload(root))
+            next_status = time.time() + STATUS_INTERVAL
+            next_ping = time.time() + PING_INTERVAL
 
-        while running[0]:
-            now = time.time()
-            if now >= next_status:
-                send_json(ws, status_payload(root))
-                next_status = now + STATUS_INTERVAL
-            if now >= next_ping:
-                send_json(ws, {"type": "ping", "ts": int(now)})
-                next_ping = now + PING_INTERVAL
+            while running[0]:
+                now = time.time()
+                if now >= next_status:
+                    send_json(ws, status_payload(root))
+                    next_status = now + STATUS_INTERVAL
+                if now >= next_ping:
+                    send_json(ws, {"type": "ping", "ts": int(now)})
+                    next_ping = now + PING_INTERVAL
 
-            try:
-                raw = ws.recv(timeout=2)
-            except TimeoutError:
-                continue
-            if not raw:
-                continue
-            try:
-                msg = json.loads(raw)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(msg, dict):
-                handle_message(ws, msg, root, name)
+                try:
+                    raw = ws.recv(timeout=2)
+                except TimeoutError:
+                    continue
+                if not raw:
+                    continue
+                try:
+                    msg = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(msg, dict):
+                    handle_message(ws, msg, root, name)
+    finally:
+        terminal_stop()
 
 
 def main() -> None:

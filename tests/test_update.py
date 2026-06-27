@@ -1,4 +1,5 @@
 import tempfile
+import sys
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -106,32 +107,22 @@ class SystemUpdateTest(unittest.TestCase):
 
 
 class GlassAgentUpdateCommandTest(unittest.TestCase):
-    """The agent's update command cycles a running silicon: stop → update → start."""
+    """The agent's update command applies the Git updater and restarts if needed."""
 
-    def _run(self, statuses):
+    def _run(self, stdout):
         import glass_agent
 
         calls = []
-        status_iter = iter(statuses)
-        last = {"status": statuses[-1]}
-
-        def fake_status(root):
-            try:
-                last["status"] = next(status_iter)
-            except StopIteration:
-                pass
-            return last["status"]
 
         def fake_run(cmd, **kwargs):
-            calls.append(("run", cmd))
-            return mock.Mock(returncode=0, stdout="updated to 1.2.0", stderr="")
+            calls.append(("run", cmd, kwargs))
+            return mock.Mock(returncode=0, stdout=stdout, stderr="")
 
         def fake_popen(cmd, **kwargs):
-            calls.append(("popen", cmd))
+            calls.append(("popen", cmd, kwargs))
             return mock.Mock()
 
-        with mock.patch.object(glass_agent, "detect_status", side_effect=fake_status), \
-             mock.patch.object(glass_agent.subprocess, "run", side_effect=fake_run), \
+        with mock.patch.object(glass_agent.subprocess, "run", side_effect=fake_run), \
              mock.patch.object(glass_agent.subprocess, "Popen", side_effect=fake_popen), \
              mock.patch.object(glass_agent.time, "sleep"):
             status, detail = glass_agent.execute_command(
@@ -139,24 +130,25 @@ class GlassAgentUpdateCommandTest(unittest.TestCase):
             )
         return status, detail, calls
 
-    def test_running_silicon_is_stopped_updated_and_restarted(self):
-        # First check says running (was_running); after the stop it's stopped.
-        status, detail, calls = self._run(["running", "stopped", "stopped"])
-        self.assertEqual(status, "done")
-        self.assertIn("restarted", detail)
-        run_cmds = [c[1] for c in calls if c[0] == "run"]
-        self.assertEqual(run_cmds[0][:2], ["silicon", "stop"])
-        self.assertEqual(run_cmds[1][:2], ["silicon", "update"])
-        popen_cmds = [c[1] for c in calls if c[0] == "popen"]
-        self.assertEqual(popen_cmds[0][:2], ["silicon", "start"])
+    def test_git_update_result_restarts_silicon(self):
+        status, detail, calls = self._run('{"status": "updated", "version": "1.5", "mode": "merge"}\n')
 
-    def test_stopped_silicon_updates_without_restart(self):
-        status, detail, calls = self._run(["stopped"])
         self.assertEqual(status, "done")
-        self.assertNotIn("restarted", detail)
+        self.assertIn("updated to 1.5", detail)
+        self.assertIn("restarting", detail)
+        run_cmds = [c[1] for c in calls if c[0] == "run"]
+        self.assertEqual(run_cmds[0][0:2], [sys.executable, "-c"])
+        self.assertIn("git_apply", run_cmds[0][2])
+        self.assertEqual(calls[0][2]["cwd"], "/tmp/x")
+        popen_cmds = [c[1] for c in calls if c[0] == "popen"]
+        self.assertEqual(popen_cmds[0], ["sh", "-c", 'sleep 3; silicon restart "$1"', "_", "worker"])
+
+    def test_up_to_date_result_does_not_restart(self):
+        status, detail, calls = self._run('{"status": "up_to_date", "version": "1.5"}\n')
+        self.assertEqual(status, "done")
+        self.assertEqual(detail, "already on 1.5")
         run_cmds = [c[1] for c in calls if c[0] == "run"]
         self.assertEqual(len(run_cmds), 1)
-        self.assertEqual(run_cmds[0][:2], ["silicon", "update"])
         self.assertEqual([c for c in calls if c[0] == "popen"], [])
 
 
